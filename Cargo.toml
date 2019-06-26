@@ -5,3 +5,8 @@ authors = ["Michael Chen <920901835@qq.com>"]
 edition = "2018"
 
 [dependencies]
+csv = "1"
+rayon = "1.1"
+serde = "1"
+serde_derive = "1"
+csv-index = "0.1"
