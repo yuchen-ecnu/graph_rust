@@ -1,17 +1,26 @@
 #[macro_use]
 extern crate serde_derive;
 
-use csv::{Position, ReaderBuilder};
+use csv::{Error, Position, ReaderBuilder};
 use csv_index::RandomAccessSimple;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::io::Cursor;
+use std::io::Write;
 use std::str::FromStr;
-use std::string::ParseError;
-use std::sync::mpsc::{channel, Receiver, Sender};
+
+mod errors;
+
+use crate::errors::graph_build_error::BuildGraphError;
+use errors::parse_attr_error::ParseAttrError;
+use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
+use uuid::Uuid;
 
 /// This defines the acceptable attribute type: Int, Float Or Text
 /// We define the type that does not exist in the enumeration as a String.
@@ -38,16 +47,16 @@ pub enum Attr {
 ///
 /// Maybe we can do some pretreatments for the data file by the prior knowledge to speedup the process.
 impl FromStr for Attr {
-    type Err = ParseError;
+    type Err = ParseAttrError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.parse::<i64>().is_ok() {
-            return Ok(Attr::Int(s.parse().unwrap()));
+            return Ok(Attr::Int(s.parse()?));
         }
         if s.parse::<f64>().is_ok() {
-            return Ok(Attr::Int(s.parse().unwrap()));
+            return Ok(Attr::Int(s.parse()?));
         }
-        return Ok(Attr::Text(s.to_string()));
+        Ok(Attr::Text(s.to_string()))
     }
 }
 
@@ -65,7 +74,7 @@ struct Edge<T> {
 }
 
 #[derive(Clone, Deserialize)]
-struct Vertex<T> {
+pub struct Vertex<T> {
     id: T,
     attrs: Vec<Attr>,
 }
@@ -73,6 +82,14 @@ struct Vertex<T> {
 impl<T> Vertex<T> {
     fn new(id: T) -> Vertex<T> {
         Vertex { id, attrs: vec![] }
+    }
+}
+impl<T> PartialEq for Vertex<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Vertex<T>) -> bool {
+        self.id == other.id
     }
 }
 
@@ -105,6 +122,36 @@ pub struct Graph<T> {
     neighbour_index: HashMap<T, (usize, usize)>,
 }
 
+impl<T> Graph<T> {
+    fn get_vertex(&self, id: &T) -> Option<Vertex<T>>
+    where
+        T: Eq + Hash + Clone,
+    {
+        let v_index = self.vertex_index.get(id).unwrap();
+        if let Some(v) = self.vertices.get(*v_index) {
+            return Some(v.clone());
+        }
+        None
+    }
+
+    fn get_neighbours(&self, id: &T) -> Vec<Vertex<T>>
+    where
+        T: Eq + Hash + Clone,
+    {
+        if let Some((start_pos, end_pos)) = self.neighbour_index.get(id) {
+            let mut neighbours = vec![];
+            let start_pos = start_pos.clone();
+            let end_pos = end_pos.clone();
+            for edge in start_pos..end_pos {
+                let edge = self.edges[edge].clone();
+                neighbours.push(self.get_vertex(&edge.target).unwrap());
+            }
+            return neighbours;
+        }
+        vec![]
+    }
+}
+
 /// Structure `GraphReader` used to read a graph csv files in parallel to construct a graph structure
 /// (edges,vertices,etc) and store some basic infomations about .
 ///
@@ -133,7 +180,7 @@ pub struct Graph<T> {
 ///
 /// ```
 ///  use graph_rust::{GraphReader, GraphType};
-///  let g = GraphReader::default()
+///  let g = GraphReader::default()?
 ///    .with_dir(GraphType::Directed)
 ///    .with_schema(String::from("..."))
 ///    .from_file(String::from("data_edges.csv"), None, b',')
@@ -148,20 +195,21 @@ pub struct GraphReader {
     edge_file_path: String,
     node_file_path: Option<String>,
     thread_pool_size: u64,
-    thread_pool: ThreadPool,
+    thread_pool: Vec<JoinHandle<()>>,
 }
 
 impl GraphReader {
     pub fn default() -> GraphReader {
-        return GraphReader {
+        let g = GraphReader {
             schema: "".to_string(),
             node_file_path: None,
             edge_file_path: "".to_string(),
             separate: b',',
             graph_type: GraphType::Directed,
             thread_pool_size: 4,
-            thread_pool: ThreadPoolBuilder::new().num_threads(4).build().unwrap(),
+            thread_pool: vec![],
         };
+        g
     }
 
     pub fn with_dir(&mut self, dir: GraphType) -> &mut GraphReader {
@@ -191,32 +239,63 @@ impl GraphReader {
         self
     }
 
+    /// Construct graph from reader.(Only for testing.)
+    /// For reusing the code, we write the data into a temp file,and reuse the origin algorithm.
+    pub fn from_reader(
+        &mut self,
+        edge_buf: String,
+        node_buf: Option<String>,
+        sep: u8,
+    ) -> &mut GraphReader {
+        let edge_path_addr = format!("temp_edge_data_{}.txt", Uuid::new_v4());
+        let edge_path = Path::new(&edge_path_addr);
+        let mut edge_file = match File::create(&edge_path) {
+            Err(_) => panic!("couldn't create {}", edge_path_addr),
+            Ok(file) => file,
+        };
+        write!(edge_file, "{}", edge_buf);
+        self.edge_file_path = edge_path_addr;
+        if node_buf.is_some() {
+            let node_path_addr = format!("temp_node_data_{}.txt", Uuid::new_v4());
+            let node_path = Path::new(&node_path_addr);
+            let mut node_file = match File::create(&node_path) {
+                Err(_) => panic!("couldn't create {}", node_path_addr),
+                Ok(file) => file,
+            };
+            write!(node_file, "{}", node_buf.unwrap());
+            self.node_file_path = Some(node_path_addr);
+        }
+        self.separate = sep;
+        self
+    }
+
     /// Call function `build` to generate a instance of `Graph` in parallel.
     /// In this function use `thread_pool_size` threads for reading edge file and node file.
     /// You can modify the `thread_pool_size` by method `with_thread(thread_size: u64)`,while
     /// the param `thread_size` need to be larger than 1.
     ///
     /// The basic process in this method as follows:
-    /// 1. Set up thread pool with the configurations provided by user,
-    /// 2. Build a empty instance of `Graph` for filling later,
-    /// 3. Create index for edge file used to separate file for threads,
-    ///      and obtains edge key names from file,
-    /// 4. Construct channel for threads' communication,
-    /// 5. Distribute reading task for threads and run them,
-    /// 6. Collecting thread's result on last thread in pool,
-    /// 7. (Optional) Reading vertices file by parallel if there exist,
-    /// 8. Generating index for vertices vector and edges vector.
-    pub fn build<T>(&mut self) -> Graph<T>
+    ///     1. Build a empty instance of `Graph` for filling later,
+    ///     2. Read edge file in parallel by calling function `read_file_in_parallel`,
+    ///     3. (Optional) Read node file in parallel if there exist a node file path,
+    ///     4. Generating index for vertices vector and edges vector.
+    ///
+    /// # Feature Explanation
+    /// 1. Storing layout of graph: in structure graph, we stores the edges and vertices in a
+    ///     `Vec<Edge>` and `Vec<Vertex>`, so what will happen when we need to get a vertex neighbours
+    ///     which id is 1? We need to search from the first position of Vec<Vertex> in graph, and
+    ///     then we need to search from the first position to end of Vec<Edge> in graph. That's
+    ///     cost a lot. So we generating two index for vertices and neighbours.
+    /// 2. Vertex index used for indexing nodes by id and return the pos of vertex in vector `vertices`.
+    ///     And neighbour_index used for indexing node's neighbours start and end index by source's
+    ///     id, and return pos in vector `edges`,
+    pub fn build<T>(&mut self) -> Result<Graph<T>, BuildGraphError>
     where
-        T: Eq + Hash + FromStr + Display + Clone + Copy + Sync + Send + Ord,
+        T: Eq + Hash + FromStr + Display + Clone + Copy + Debug + Send,
         <T as FromStr>::Err: Debug,
         for<'de> T: Deserialize<'de>,
+        T: 'static,
     {
-        self.thread_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.thread_pool_size as usize)
-            .build()
-            .unwrap();
-
         let mut g = Graph {
             graph_type: self.graph_type.clone(),
             vertices: vec![],
@@ -227,151 +306,235 @@ impl GraphReader {
             vertex_index: HashMap::new(),
         };
 
-        let directed = match self.graph_type {
-            GraphType::Directed => true,
-            GraphType::Undirected => false,
-        };
+        let sep = self.separate;
         let has_node_file = self.node_file_path.is_some();
 
-        let sep = self.separate;
-        let edge_file = &self.edge_file_path;
-        // preserve a thread for collecting
-        let worker_count = self.thread_pool_size - 1;
-
-        // 0.Create index for separating file
-        let mut rdr = ReaderBuilder::new()
-            .has_headers(true)
-            .delimiter(sep)
-            .from_path(edge_file)
-            .expect("Please check `edge_file` path");
-        let mut wtr = Cursor::new(vec![]);
-        RandomAccessSimple::create(&mut rdr, &mut wtr);
-        let mut idx = RandomAccessSimple::open(wtr).unwrap();
-        // Obtains key names from file
-        for key in rdr.headers().unwrap().iter() {
-            g.edge_key.push(key.to_string());
-        }
-
-        // 1. Construct channel for threads' communication,
-        //    Transmit Box pointer here to avoid large memory copy.
-        let (tx, rx) = channel();
-
-        // 2. Distribute reading task for threads.
-        let job_size = idx.len() / worker_count + 1;
-        let mut real_worker_count = worker_count;
-        for i in 0..worker_count {
-            let tx = tx.clone();
-            let start_index = job_size * i + 1;
-            // Break distribute when no more jobs
-            if start_index >= idx.len() {
-                real_worker_count = i;
-                break;
-            }
-            let start_pos = idx.get(start_index as u64).unwrap();
-            self.thread_pool.install(move || {
-                read_edge_file_task(
-                    sep,
-                    &edge_file,
-                    start_pos,
-                    job_size,
-                    directed,
-                    has_node_file,
-                    tx,
-                );
-            });
-        }
-
-        // 3. Collecting thread's result.
-        let mut vertices: HashMap<T, Vertex<T>> = HashMap::new();
-        let mut edges: HashMap<T, Vec<Edge<T>>> = HashMap::new();
-        let (tx_collect, rx_collect) = channel();
-        self.thread_pool
-            .install(|| collect_edge_task(has_node_file, real_worker_count, rx, tx_collect));
-        let (vertices_rec, edges_rec) = rx_collect.recv().unwrap();
-        vertices = *vertices_rec;
-        edges = *edges_rec;
-
+        // Read file in parallel
+        let (mut vertices_arc, edges_arc) = read_file_in_parallel(
+            &self.edge_file_path,
+            sep,
+            true,
+            has_node_file,
+            self.thread_pool_size,
+            &mut g,
+        )?;
         if has_node_file {
-            let node_file_path = self.node_file_path.clone().unwrap();
-            // 0.Create index for node file
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(true)
-                .delimiter(sep)
-                .from_path(&node_file_path)
-                .expect("Please check `node_file` path");
-            let mut wtr = Cursor::new(vec![]);
-            RandomAccessSimple::create(&mut rdr, &mut wtr);
-            let mut idx = RandomAccessSimple::open(wtr).unwrap();
-            // Obtains key names from file
-            for key in rdr.headers().unwrap().iter() {
-                g.vertex_key.push(key.to_string());
-            }
-
-            // 1. Construct channel for threads' communication.
-            let (tx, rx) = channel();
-
-            // 2. Distribute reading task for threads.
-            let job_size = idx.len() / worker_count + 1;
-            for i in 0..self.thread_pool_size {
-                let tx = tx.clone();
-                let start_index = job_size * i + 1;
-                if start_index >= idx.len() {
-                    real_worker_count = i;
-                    break;
-                }
-                let start_pos = idx.get(start_index).unwrap();
-                self.thread_pool
-                    .install(|| read_node_file_task(sep, &node_file_path, start_pos, job_size, tx));
-            }
-
-            // 3. Collecting thread's result.
-            let (tx_collect, rx_collect) = channel();
-            self.thread_pool
-                .install(|| collect_node_task(real_worker_count, rx, tx_collect));
-            vertices = *rx_collect.recv().unwrap();
+            let (vertices_rec, _edges) = read_file_in_parallel(
+                &self.node_file_path.clone().unwrap(),
+                sep,
+                false,
+                has_node_file,
+                self.thread_pool_size,
+                &mut g,
+            )?;
+            vertices_arc = vertices_rec;
         }
 
         // Generating index
-        let mut cur_index = 0;
+        let mut vertices = Arc::try_unwrap(vertices_arc)?.into_inner()?;
+        let mut edges = Arc::try_unwrap(edges_arc)?.into_inner()?;
+
+        let mut cur_edge_index = 0;
+        let mut cur_node_index = 0;
         for (id, v) in vertices {
             let edge_opt = edges.get_mut(&id);
+            g.vertex_index.insert(v.id, cur_node_index);
+            cur_node_index += 1;
             g.vertices.push(v);
             if edge_opt.is_none() {
                 continue;
             }
             let edge_vec: &mut Vec<Edge<T>> = edge_opt.unwrap();
             g.neighbour_index
-                .insert(id, (cur_index, cur_index + edge_vec.len()));
-            cur_index = cur_index + edge_vec.len();
+                .insert(id, (cur_edge_index, cur_edge_index + edge_vec.len()));
+            cur_edge_index = cur_edge_index + edge_vec.len();
             g.edges.append(edge_vec);
         }
-        g
+        Ok(g)
     }
 }
 
-fn read_edge_file_task<T>(
+/// Call function `read_file_in_parallel` to read vertex file or edge file and transform them
+/// into `HashMap` by parallel.
+///
+/// # Parameters
+/// Here are the descriptions for the parameters:
+///     1. file_path: the csv file path which we need to read,
+///     2. sep: the separator of the file to be read,
+///     3. is_edge_file: the file to be read is for edge(true) or for node(false),
+///     4. has_node_file: user configure `GraphReader` with a node file path(true) or not(false),
+///     5. worker_count: the thread pool size which user configure in `GraphReader`,
+///     6. graph: the graph for storing the vertices and edges key attributes.
+///
+/// # Responsibility
+/// 1. Build csv file index for separating file reading task to threads.
+/// 2. Calculate task size and start index for reading in threads.
+/// 3. Waiting all thread finish jobs.
+/// 4. Return vertices or edges set (HashMap) to caller.
+///
+/// # Feature Explanation
+/// 1. In this function, we use shared-memory to process the communication between main thread with
+///     sub-threads.
+/// 2. We construct the type `Arc<Mutex<T>> for storing the reading result in different thread.
+///     We use this structure for two reasons:
+///     - `Arc` allow us to sharing memory with Thread Safety, while the container data in `Arc` can
+///         not be modified.
+///     - At the same time, the data stores in `Arc` need to be update with the reading process in
+///         different thread. So, there exist race condition here.
+///     So we use a `Mutex` to wrap the content data. Finally, we got a structure `Arc<Mutex<T>>`
+/// 3. In this function, we use `join` to waiting for all sub-threads finished jobs on main thread.
+fn read_file_in_parallel<T>(
+    file_path: &String,
     sep: u8,
-    edge_file: &String,
+    is_edge_file: bool,
+    has_node_file: bool,
+    worker_count: u64,
+    graph: &mut Graph<T>,
+) -> Result<
+    (
+        Arc<Mutex<HashMap<T, Vertex<T>>>>,
+        Arc<Mutex<HashMap<T, Vec<Edge<T>>>>>,
+    ),
+    Error,
+>
+where
+    T: Eq + Hash + FromStr + Display + Copy + Debug + Send,
+    for<'de> T: Deserialize<'de>,
+    T: 'static,
+    <T as FromStr>::Err: Debug,
+{
+    let vertices = Arc::new(Mutex::new(HashMap::new()));
+    let edges = Arc::new(Mutex::new(HashMap::new()));
+
+    let directed = match graph.graph_type {
+        GraphType::Directed => true,
+        GraphType::Undirected => false,
+    };
+
+    // Create index for separating file
+    let mut idx = build_csv_index(file_path, sep, true, graph)?;
+
+    // Calculate and distribute jobs index for threads.
+    let job_size = idx.len() / worker_count + 1;
+    let mut real_worker_count = worker_count;
+    real_worker_count = (idx.len() - 1) / job_size;
+    if (idx.len() - 1) % job_size != 0 {
+        real_worker_count += 1;
+    }
+    let mut thread_pool = vec![];
+    for i in 0..real_worker_count {
+        let start_index = job_size * i + 1;
+        let edge_file = file_path.clone();
+        let start_pos = idx.get(start_index as u64)?;
+        let vertices_arc = vertices.clone();
+        let edges_arc = edges.clone();
+        thread_pool.push(thread::spawn(move || {
+            read_file_task(
+                sep,
+                edge_file,
+                start_pos,
+                job_size,
+                directed,
+                is_edge_file,
+                has_node_file,
+                vertices_arc,
+                edges_arc,
+            );
+        }));
+    }
+    for t in thread_pool {
+        t.join();
+    }
+    Ok((vertices, edges))
+}
+
+/// Call function `build_csv_index` to generate the index for the file in the parameter,
+/// and reading the csv header stored in `Graph`. The function return the file index at last.
+///
+/// # Parameters
+/// Here are the descriptions for the parameters:
+///     1. file_path: the file which need to building index.
+///     2. sep: the separator of the file to be read.
+///     3. is_edge_file: the file for generating index is edge file(true) or node file(false).
+///     4. graph: the `Graph` for storing csv header.
+fn build_csv_index<T>(
+    file_path: &String,
+    sep: u8,
+    is_edge_file: bool,
+    graph: &mut Graph<T>,
+) -> Result<RandomAccessSimple<Cursor<Vec<u8>>>, Error> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .delimiter(sep)
+        .from_path(file_path)
+        .expect("Please check file path");
+    let mut wtr = Cursor::new(vec![]);
+    RandomAccessSimple::create(&mut rdr, &mut wtr);
+    let idx = RandomAccessSimple::open(wtr)?;
+    if is_edge_file {
+        for key in rdr.headers()?.iter() {
+            graph.edge_key.push(key.to_string());
+        }
+    } else {
+        for key in rdr.headers()?.iter() {
+            graph.vertex_key.push(key.to_string());
+        }
+    }
+    Ok(idx)
+}
+
+///
+/// In this function, reads file content in parallel and formats to specific structure of vertex
+/// or edge with the configuration in `Graph` g.
+///
+/// # Parameters
+/// Here are the descriptions for the parameters:
+///     1. sep: the separator of the file to be read.
+///     2. file_path: the file which need to building index.
+///     3. start_pos: the task for reading file need to read start at which position.
+///     4. job_size: the records size need to be read.
+///     5. is_directed: the file reading now is directed or not (Only for edge file).
+///     6. is_edge_file: the file for reading is edge file(true) or node file(false).
+///     7. has_node_file: user configure `GraphReader` with a node file path(true) or not(false).
+///         The function will generate a default vertex only with id if the parameter is false.
+///     8. vertices: the point to a memory for storing the reading result of vertices.
+///     9. edges: the point to a memory for storing the reading result of edges.
+fn read_file_task<T>(
+    sep: u8,
+    file_path: String,
     start_pos: Position,
     job_size: u64,
-    directed: bool,
-    node_file: bool,
-    tx: Sender<(Box<HashMap<T, Vertex<T>>>, Box<HashMap<T, Vec<Edge<T>>>>)>,
+    is_directed: bool,
+    is_edge_file: bool,
+    has_node_file: bool,
+    vertices: Arc<Mutex<HashMap<T, Vertex<T>>>>,
+    edges: Arc<Mutex<HashMap<T, Vec<Edge<T>>>>>,
 ) where
     T: Eq + Hash + FromStr + Display + Clone + Copy,
     for<'de> T: Deserialize<'de>,
     <T as FromStr>::Err: Debug,
 {
-    let mut vertices = Box::new(HashMap::new());
-    let mut edges = Box::new(HashMap::new());
-
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .delimiter(sep)
-        .from_path(edge_file)
-        .expect("Please check `edge_file` path");
+        .from_path(file_path)
+        .expect("Please check file path");
     rdr.seek(start_pos).expect("File split error!");
 
+    if !is_edge_file {
+        let mut iter = rdr.deserialize();
+        for _ in 0..job_size {
+            let vertex_info = iter.next().unwrap();
+            if vertex_info.is_err() {
+                println!("{}", vertex_info.err().unwrap());
+                continue;
+            }
+            let v: Vertex<T> = vertex_info.unwrap();
+            let mut data = vertices.lock().unwrap();
+            data.insert(v.id, v);
+        }
+        return;
+    }
     let mut iter = rdr.deserialize();
     for _ in 0..job_size {
         let origin_line = iter.next().unwrap();
@@ -379,105 +542,29 @@ fn read_edge_file_task<T>(
             println!("{}", origin_line.err().unwrap());
             continue;
         }
+        let line_info: Edge<T> = origin_line.unwrap();
+        let source = line_info.source;
+        let target = line_info.target;
+        let attrs = line_info.attrs;
 
-        let edge_info: Edge<T> = origin_line.unwrap();
-        let source = edge_info.source;
-        let target = edge_info.target;
-        let attrs = edge_info.attrs;
-
-        if !directed {
-            add_edge(&mut edges, target, source, attrs.clone());
+        let mut data = edges.lock().unwrap();
+        // Generating a reverse edge for undirected graph.
+        if !is_directed {
+            add_edge(&mut data, target, source, attrs.clone());
         }
-        add_edge(&mut edges, source, target, attrs.clone());
+        add_edge(&mut data, source, target, attrs.clone());
 
-        if !node_file {
-            if !vertices.contains_key(&edge_info.source) {
-                vertices.insert(edge_info.source, Vertex::new(edge_info.source));
-            }
-            if !vertices.contains_key(&edge_info.target) {
-                vertices.insert(edge_info.target, Vertex::new(edge_info.target));
-            }
-        }
-    }
-    tx.send((vertices, edges));
-}
-
-fn read_node_file_task<T>(
-    sep: u8,
-    node_file: &String,
-    start_index: Position,
-    job_size: u64,
-    tx: Sender<Box<HashMap<T, Vertex<T>>>>,
-) where
-    T: Eq + Hash + FromStr + Display + Copy,
-    for<'de> T: Deserialize<'de>,
-    <T as FromStr>::Err: Debug,
-{
-    let mut vertices = Box::new(HashMap::new());
-
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(false)
-        .delimiter(sep)
-        .from_path(node_file)
-        .expect("Please check `node_file` path");
-    rdr.seek(start_index).expect("File split error!");
-
-    let mut iter = rdr.deserialize();
-    for _ in 0..job_size {
-        let origin_line = iter.next().unwrap();
-        if origin_line.is_err() {
-            println!("{}", origin_line.err().unwrap());
-            continue;
-        }
-
-        let v: Vertex<T> = origin_line.unwrap();
-        vertices.insert(v.id, v);
-    }
-    tx.send(vertices);
-}
-
-fn collect_node_task<T>(
-    job_count: u64,
-    rx: Receiver<Box<HashMap<T, Vertex<T>>>>,
-    tx: Sender<Box<HashMap<T, Vertex<T>>>>,
-) where
-    T: Eq + Hash,
-{
-    let mut vertices = Box::new(HashMap::new());
-    for _ in 0..job_count {
-        let mut vertices_rec = rx.recv().unwrap();
-        for (id, v) in *vertices_rec {
-            vertices.insert(id, v);
-        }
-    }
-    tx.send(vertices);
-}
-
-fn collect_edge_task<T>(
-    has_node_file: bool,
-    job_count: u64,
-    rx: Receiver<(Box<HashMap<T, Vertex<T>>>, Box<HashMap<T, Vec<Edge<T>>>>)>,
-    tx: Sender<(Box<HashMap<T, Vertex<T>>>, Box<HashMap<T, Vec<Edge<T>>>>)>,
-) where
-    T: Eq + Hash,
-{
-    let mut vertices = Box::new(HashMap::new());
-    let mut edges = Box::new(HashMap::new());
-    for _ in 0..job_count {
-        let (vertices_rec, edges_rec) = rx.recv().unwrap();
+        // Generating a default node if there is no node file in configurations.
         if !has_node_file {
-            for (id, v) in *vertices_rec {
-                vertices.insert(id, v);
+            let mut data = vertices.lock().unwrap();
+            if !data.contains_key(&line_info.source) {
+                data.insert(line_info.source, Vertex::new(line_info.source));
             }
-        }
-        for (id, vec) in *edges_rec {
-            let edge_vec = edges.entry(id).or_insert(Vec::new());
-            for e in vec {
-                edge_vec.push(e);
+            if !data.contains_key(&line_info.target) {
+                data.insert(line_info.target, Vertex::new(line_info.target));
             }
         }
     }
-    tx.send((vertices, edges));
 }
 
 /// Assistance function for initial edge set
@@ -523,7 +610,7 @@ pub trait Reset {
 
 pub struct Bfs<'a, T> {
     pub bind_graph: &'a Graph<T>,
-    pub stack: VecDeque<T>,
+    pub stack: VecDeque<Vertex<T>>,
     pub visited: HashSet<T>,
     pub start: T,
 }
@@ -541,7 +628,7 @@ where
         };
         bfs.visited.insert(start);
         bfs.stack.clear();
-        bfs.stack.push_front(start);
+        bfs.stack.push_front(graph.get_vertex(&start).unwrap());
         bfs
     }
 }
@@ -550,11 +637,11 @@ impl<'a, T> Iterator for Bfs<'a, T>
 where
     T: Copy + PartialEq + Eq + Hash,
 {
-    type Item = T;
+    type Item = Vertex<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(node) = self.stack.pop_front() {
-            let neighbour_index_opt = self.bind_graph.neighbour_index.get(&node);
+            let neighbour_index_opt = self.bind_graph.neighbour_index.get(&node.id);
             if neighbour_index_opt.is_none() {
                 return Some(node);
             }
@@ -565,7 +652,8 @@ where
                 let cur = self.bind_graph.edges.get(i).unwrap();
                 if !self.visited.contains(&cur.target) {
                     self.visited.insert(cur.target);
-                    self.stack.push_back(cur.target);
+                    self.stack
+                        .push_back(self.bind_graph.get_vertex(&cur.target).unwrap());
                 }
                 i += 1;
             }
@@ -584,7 +672,8 @@ where
         self.visited.clear();
         self.visited.insert(self.start);
         self.stack.clear();
-        self.stack.push_front(self.start);
+        self.stack
+            .push_front(self.bind_graph.get_vertex(&self.start).unwrap());
     }
 }
 
@@ -614,7 +703,7 @@ where
 /// ```
 pub struct Dfs<'a, T> {
     pub bind_graph: &'a Graph<T>,
-    pub stack: Vec<T>,
+    pub stack: Vec<Vertex<T>>,
     pub visited: HashSet<T>,
     pub start: T,
 }
@@ -632,7 +721,7 @@ where
         };
         dfs.visited.insert(start);
         dfs.stack.clear();
-        dfs.stack.push(start);
+        dfs.stack.push(graph.get_vertex(&start).unwrap());
         dfs
     }
 }
@@ -641,11 +730,11 @@ impl<'a, T> Iterator for Dfs<'a, T>
 where
     T: Copy + PartialEq + Eq + Hash,
 {
-    type Item = T;
+    type Item = Vertex<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(node) = self.stack.pop() {
-            let neighbour_index_opt = self.bind_graph.neighbour_index.get(&node);
+            let neighbour_index_opt = self.bind_graph.neighbour_index.get(&node.id);
             if neighbour_index_opt.is_none() {
                 return Some(node);
             }
@@ -656,7 +745,8 @@ where
                 let cur = self.bind_graph.edges.get(i).unwrap();
                 if !self.visited.contains(&cur.target) {
                     self.visited.insert(cur.target);
-                    self.stack.push(cur.target);
+                    self.stack
+                        .push(self.bind_graph.get_vertex(&cur.target).unwrap());
                 }
                 i += 1;
             }
@@ -675,7 +765,8 @@ where
         self.visited.clear();
         self.visited.insert(self.start);
         self.stack.clear();
-        self.stack.push(self.start);
+        self.stack
+            .push(self.bind_graph.get_vertex(&self.start).unwrap());
     }
 }
 
@@ -685,11 +776,14 @@ fn other_traversal_algorithms() {}
 /// Test case here
 #[cfg(test)]
 mod tests {
-    use crate::{Bfs, Dfs, GraphReader, GraphType};
+    use crate::errors::graph_build_error::BuildGraphError;
+    use crate::{Bfs, Dfs, Graph, GraphReader, GraphType, Vertex};
     use std::cmp::Ordering;
+    use std::collections::{HashMap, HashSet};
+    use std::hash::Hash;
 
     #[test]
-    fn file_reading_test() {
+    fn file_reading_test() -> Result<(), BuildGraphError> {
         let g = GraphReader::default()
             .with_dir(GraphType::Directed)
             .with_schema(String::from("..."))
@@ -699,7 +793,7 @@ mod tests {
                 b',',
             )
             .with_thread(10)
-            .build::<i32>();
+            .build::<i32>()?;
         let mut vec = vec![];
         for v in g.vertices {
             vec.push(v.id);
@@ -721,10 +815,47 @@ mod tests {
             return s1.cmp(s2);
         });
         assert_eq!(edges, vec![(1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (2, 4)]);
+        Ok(())
     }
 
     #[test]
-    fn dfs_iter_test() {
+    fn build_graph_in_memory_test() -> Result<(), BuildGraphError> {
+        let edge_data = "source,target,a,b,c\
+                         \n1,2,1,2,3\n1,3,1,2,3\n1,4,1,2,3\
+                         \n2,1,1,2,3\n2,3,1,2,3\n2,4,1,2,3";
+        let node_data = "id,a\n1,1\n2,1\n3,1\n4,1";
+        let g = GraphReader::default()
+            .with_dir(GraphType::Directed)
+            .with_schema(String::from("..."))
+            .from_reader(edge_data.to_string(), Some(node_data.to_string()), b',')
+            .with_thread(10)
+            .build::<i32>()?;
+        let mut vec = vec![];
+        for v in g.vertices {
+            vec.push(v.id);
+        }
+        vec.sort();
+        assert_eq!(vec, vec![1, 2, 3, 4]);
+
+        let mut edges = vec![];
+        for e in g.edges {
+            edges.push((e.source, e.target));
+        }
+        edges.sort_by(|(s1, t1), (s2, t2)| {
+            if s1 == s2 {
+                if t1 == t2 {
+                    return Ordering::Equal;
+                }
+                return t1.cmp(t2);
+            }
+            return s1.cmp(s2);
+        });
+        assert_eq!(edges, vec![(1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (2, 4)]);
+        Ok(())
+    }
+
+    #[test]
+    fn dfs_iter_test_directed() -> Result<(), BuildGraphError> {
         let g = GraphReader::default()
             .with_dir(GraphType::Directed)
             .with_schema(String::from("..."))
@@ -734,14 +865,25 @@ mod tests {
                 b',',
             )
             .with_thread(10)
-            .build();
+            .build()?;
         let dfs = Dfs::new(&g, 1);
-        let res: Vec<i32> = dfs.collect();
-        assert_eq!(res, vec![1, 4, 3, 2]);
+        let mut res: Vec<Vertex<i32>> = dfs.collect();
+        let mut parent = res.pop().unwrap();
+        let mut stack = vec![];
+        let mut map = HashMap::new();
+        map.insert(parent.id, 1);
+        stack.push(map);
+        for v in res {
+            let neighbours: Vec<i32> = g.get_neighbours(&parent.id).iter().map(|v| v.id).collect();
+            if !neighbours.contains(&v.id) {}
+            assert_eq!(neighbours.contains(&v.id), true);
+            parent = v;
+        }
+        Ok(())
     }
 
     #[test]
-    fn bfs_iter_test() {
+    fn bfs_iter_test_directed() -> Result<(), BuildGraphError> {
         let g = GraphReader::default()
             .with_dir(GraphType::Directed)
             .with_schema(String::from("..."))
@@ -751,13 +893,102 @@ mod tests {
                 b',',
             )
             .with_thread(10)
-            .build();
+            .build()?;
         let bfs = Bfs::new(&g, 1);
-        let res: Vec<i32> = bfs.collect();
-        assert_eq!(res, vec![1, 2, 3, 4]);
+        let res: Vec<Vertex<i32>> = bfs.collect();
+        Ok(())
     }
 
-    //TODO(Yu Chen): allowing build graph in memory(from_reader()) and testing different graph data.
     #[test]
-    fn build_graph_in_memory_test() {}
+    fn dfs_iter_test_undirected() -> Result<(), BuildGraphError> {
+        let g = GraphReader::default()
+            .with_dir(GraphType::Undirected)
+            .with_schema(String::from("..."))
+            .from_file(
+                String::from("data_edges_undirected.csv"),
+                Option::from(String::from("data_vertices_undirected.csv")),
+                b',',
+            )
+            .with_thread(10)
+            .build()?;
+        let dfs = Dfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = dfs.collect();
+        Ok(())
+    }
+
+    #[test]
+    fn bfs_iter_test_undirected() -> Result<(), BuildGraphError> {
+        let g = GraphReader::default()
+            .with_dir(GraphType::Undirected)
+            .with_schema(String::from("..."))
+            .from_file(
+                String::from("data_edges_undirected.csv"),
+                Option::from(String::from("data_vertices_undirected.csv")),
+                b',',
+            )
+            .with_thread(10)
+            .build()?;
+        let bfs = Bfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = bfs.collect();
+        let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
+        check_bfs_valid(bfs_perm, g);
+        Ok(())
+    }
+
+    /// Check the given bfs permutation is valid for the given graph or not.
+    fn check_bfs_valid<T>(mut bfs: Vec<T>, g: Graph<T>) -> bool
+    where
+        T: Clone + Eq + Hash,
+    {
+        if bfs.len() == 0 {
+            return g.vertices.len() == 0;
+        }
+        // Initial
+        let mut match_queue = HashSet::new();
+        let mut parent_index = 1;
+        let neighbours: Vec<T> = g
+            .get_neighbours(&bfs[parent_index])
+            .iter()
+            .map(|v| v.id)
+            .collect();
+        match_queue.extend(neighbours.iter());
+
+        for id in bfs {
+            if match_queue.remove(&id) {
+                continue;
+            }
+            if match_queue.is_empty() {
+                parent_index += 1;
+                fetch_next_level_and_assert_target(&mut match_queue, &bfs[parent_index], &g, &id);
+                continue;
+            }
+            // Clear visited node
+            for i in 0..parent_index {
+                match_queue.remove(&bfs[i]);
+            }
+            assert_eq!(match_queue.len(), 0);
+            parent_index += 1;
+            fetch_next_level_and_assert_target(&mut match_queue, &bfs[parent_index], &g, &id);
+        }
+        g.vertices.len() == bfs.len()
+    }
+
+    fn fetch_next_level_and_assert_target<T>(
+        match_queue: &mut HashSet<T>,
+        root: T,
+        g: &Graph<T>,
+        target: T,
+    ) where
+        T: Clone + Eq + Hash,
+    {
+        let neighbours: Vec<T> = g.get_neighbours(&root).iter().map(|v| v.id).collect();
+        match_queue.extend(neighbours.iter());
+        assert!(match_queue.contains(&target), true);
+        match_queue.remove(&target);
+    }
+
+    ///TODO(YuChen): Check the given dfs permutation is valid for the given graph or not.
+    fn check_dfs_valid<T>(dfs: Vec<T>, g: Graph<T>) -> bool {
+        false
+    }
 }
