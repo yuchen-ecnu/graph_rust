@@ -779,45 +779,15 @@ mod tests {
     use crate::errors::graph_build_error::BuildGraphError;
     use crate::{Bfs, Dfs, Graph, GraphReader, GraphType, Vertex};
     use std::cmp::Ordering;
-    use std::collections::{HashMap, HashSet};
-    use std::hash::Hash;
 
     #[test]
     fn file_reading_test() -> Result<(), BuildGraphError> {
-        let g = GraphReader::default()
-            .with_dir(GraphType::Directed)
-            .with_schema(String::from("..."))
-            .from_file(
-                String::from("data_edges.csv"),
-                Option::from(String::from("data_vertices.csv")),
-                b',',
-            )
-            .with_thread(10)
-            .build::<i32>()?;
-        let mut vec = vec![];
-        for v in g.vertices {
-            vec.push(v.id);
-        }
-        vec.sort();
-        assert_eq!(vec, vec![1, 2, 3, 4]);
-
-        let mut edges = vec![];
-        for e in g.edges {
-            edges.push((e.source, e.target));
-        }
-        edges.sort_by(|(s1, t1), (s2, t2)| {
-            if s1 == s2 {
-                if t1 == t2 {
-                    return Ordering::Equal;
-                }
-                return t1.cmp(t2);
-            }
-            return s1.cmp(s2);
-        });
-        assert_eq!(edges, vec![(1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (2, 4)]);
+        let g = generate_directed_graph(10)?;
+        assert_eq!(check_graph_validation(g), true);
         Ok(())
     }
 
+    /// Testing the case of reading graph from string in memory.
     #[test]
     fn build_graph_in_memory_test() -> Result<(), BuildGraphError> {
         let edge_data = "source,target,a,b,c\
@@ -830,12 +800,107 @@ mod tests {
             .from_reader(edge_data.to_string(), Some(node_data.to_string()), b',')
             .with_thread(10)
             .build::<i32>()?;
+        assert_eq!(check_graph_validation(g), true);
+        Ok(())
+    }
+
+    #[test]
+    fn dfs_iter_test_directed() -> Result<(), BuildGraphError> {
+        let g = generate_directed_graph(10)?;
+        let dfs = Dfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = dfs.collect();
+        let dfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
+        assert_eq!(check_dfs_permutation_valid(&dfs_perm), true);
+        Ok(())
+    }
+
+    #[test]
+    fn bfs_iter_test_directed() -> Result<(), BuildGraphError> {
+        let g = generate_directed_graph(10)?;
+        let bfs = Bfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = bfs.collect();
+        let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
+        assert_eq!(check_bfs_permutation_valid(&bfs_perm), true);
+        Ok(())
+    }
+
+    #[test]
+    fn dfs_iter_test_undirected() -> Result<(), BuildGraphError> {
+        let g = generate_undirected_graph(10)?;
+        let dfs = Dfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = dfs.collect();
+        let dfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
+        assert_eq!(check_dfs_permutation_valid(&dfs_perm), true);
+        Ok(())
+    }
+
+    #[test]
+    fn bfs_iter_test_undirected() -> Result<(), BuildGraphError> {
+        let g = generate_undirected_graph(10)?;
+        let bfs = Bfs::new(&g, 1);
+        let res: Vec<Vertex<i32>> = bfs.collect();
+        let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
+        assert_eq!(check_bfs_permutation_valid(&bfs_perm), true);
+        Ok(())
+    }
+
+    /// Generate a undirected `Graph` instance from test files
+    fn generate_undirected_graph(thread_num: u64) -> Result<Graph<i32>, BuildGraphError> {
+        let g = GraphReader::default()
+            .with_dir(GraphType::Undirected)
+            .with_schema(String::from("..."))
+            .from_file(
+                String::from("data_edges_undirected.csv"),
+                Option::from(String::from("data_vertices_undirected.csv")),
+                b',',
+            )
+            .with_thread(thread_num)
+            .build()?;
+        Ok(g)
+    }
+
+    /// Generate a directed `Graph` instance from test files
+    fn generate_directed_graph(thread_num: u64) -> Result<Graph<i32>, BuildGraphError> {
+        let g = GraphReader::default()
+            .with_dir(GraphType::Directed)
+            .with_schema(String::from("..."))
+            .from_file(
+                String::from("data_edges.csv"),
+                Option::from(String::from("data_vertices.csv")),
+                b',',
+            )
+            .with_thread(thread_num)
+            .build::<i32>()?;
+        Ok(g)
+    }
+
+    /// Check the given bfs permutation is valid for the test graph or not.
+    fn check_bfs_permutation_valid(bfs_perm: &Vec<i32>) -> bool {
+        return bfs_perm.eq(&vec![1, 2, 3, 4])
+            || bfs_perm.eq(&vec![1, 2, 4, 3])
+            || bfs_perm.eq(&vec![1, 3, 2, 4])
+            || bfs_perm.eq(&vec![1, 3, 4, 2])
+            || bfs_perm.eq(&vec![1, 4, 2, 3])
+            || bfs_perm.eq(&vec![1, 4, 3, 2]);
+    }
+
+    /// Check the given dfs permutation is valid for the test graph or not.
+    fn check_dfs_permutation_valid(dfs_perm: &Vec<i32>) -> bool {
+        return dfs_perm.eq(&vec![1, 2, 3, 4])
+            || dfs_perm.eq(&vec![1, 2, 4, 3])
+            || dfs_perm.eq(&vec![1, 3, 2, 4])
+            || dfs_perm.eq(&vec![1, 3, 4, 2])
+            || dfs_perm.eq(&vec![1, 4, 2, 3])
+            || dfs_perm.eq(&vec![1, 4, 3, 2]);
+    }
+
+    /// Check the given graph is valid for the test graph data file.
+    fn check_graph_validation(g: Graph<i32>) -> bool {
         let mut vec = vec![];
         for v in g.vertices {
             vec.push(v.id);
         }
         vec.sort();
-        assert_eq!(vec, vec![1, 2, 3, 4]);
 
         let mut edges = vec![];
         for e in g.edges {
@@ -850,145 +915,8 @@ mod tests {
             }
             return s1.cmp(s2);
         });
-        assert_eq!(edges, vec![(1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (2, 4)]);
-        Ok(())
-    }
 
-    #[test]
-    fn dfs_iter_test_directed() -> Result<(), BuildGraphError> {
-        let g = GraphReader::default()
-            .with_dir(GraphType::Directed)
-            .with_schema(String::from("..."))
-            .from_file(
-                String::from("data_edges.csv"),
-                Option::from(String::from("data_vertices.csv")),
-                b',',
-            )
-            .with_thread(10)
-            .build()?;
-        let dfs = Dfs::new(&g, 1);
-        let mut res: Vec<Vertex<i32>> = dfs.collect();
-        let mut parent = res.pop().unwrap();
-        let mut stack = vec![];
-        let mut map = HashMap::new();
-        map.insert(parent.id, 1);
-        stack.push(map);
-        for v in res {
-            let neighbours: Vec<i32> = g.get_neighbours(&parent.id).iter().map(|v| v.id).collect();
-            if !neighbours.contains(&v.id) {}
-            assert_eq!(neighbours.contains(&v.id), true);
-            parent = v;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn bfs_iter_test_directed() -> Result<(), BuildGraphError> {
-        let g = GraphReader::default()
-            .with_dir(GraphType::Directed)
-            .with_schema(String::from("..."))
-            .from_file(
-                String::from("data_edges.csv"),
-                Option::from(String::from("data_vertices.csv")),
-                b',',
-            )
-            .with_thread(10)
-            .build()?;
-        let bfs = Bfs::new(&g, 1);
-        let res: Vec<Vertex<i32>> = bfs.collect();
-        Ok(())
-    }
-
-    #[test]
-    fn dfs_iter_test_undirected() -> Result<(), BuildGraphError> {
-        let g = GraphReader::default()
-            .with_dir(GraphType::Undirected)
-            .with_schema(String::from("..."))
-            .from_file(
-                String::from("data_edges_undirected.csv"),
-                Option::from(String::from("data_vertices_undirected.csv")),
-                b',',
-            )
-            .with_thread(10)
-            .build()?;
-        let dfs = Dfs::new(&g, 1);
-        let res: Vec<Vertex<i32>> = dfs.collect();
-        Ok(())
-    }
-
-    #[test]
-    fn bfs_iter_test_undirected() -> Result<(), BuildGraphError> {
-        let g = GraphReader::default()
-            .with_dir(GraphType::Undirected)
-            .with_schema(String::from("..."))
-            .from_file(
-                String::from("data_edges_undirected.csv"),
-                Option::from(String::from("data_vertices_undirected.csv")),
-                b',',
-            )
-            .with_thread(10)
-            .build()?;
-        let bfs = Bfs::new(&g, 1);
-        let res: Vec<Vertex<i32>> = bfs.collect();
-        let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
-        check_bfs_valid(bfs_perm, g);
-        Ok(())
-    }
-
-    /// Check the given bfs permutation is valid for the given graph or not.
-    fn check_bfs_valid<T>(mut bfs: Vec<T>, g: Graph<T>) -> bool
-    where
-        T: Clone + Eq + Hash,
-    {
-        if bfs.len() == 0 {
-            return g.vertices.len() == 0;
-        }
-        // Initial
-        let mut match_queue = HashSet::new();
-        let mut parent_index = 1;
-        let neighbours: Vec<T> = g
-            .get_neighbours(&bfs[parent_index])
-            .iter()
-            .map(|v| v.id)
-            .collect();
-        match_queue.extend(neighbours.iter());
-
-        for id in bfs {
-            if match_queue.remove(&id) {
-                continue;
-            }
-            if match_queue.is_empty() {
-                parent_index += 1;
-                fetch_next_level_and_assert_target(&mut match_queue, &bfs[parent_index], &g, &id);
-                continue;
-            }
-            // Clear visited node
-            for i in 0..parent_index {
-                match_queue.remove(&bfs[i]);
-            }
-            assert_eq!(match_queue.len(), 0);
-            parent_index += 1;
-            fetch_next_level_and_assert_target(&mut match_queue, &bfs[parent_index], &g, &id);
-        }
-        g.vertices.len() == bfs.len()
-    }
-
-    fn fetch_next_level_and_assert_target<T>(
-        match_queue: &mut HashSet<T>,
-        root: T,
-        g: &Graph<T>,
-        target: T,
-    ) where
-        T: Clone + Eq + Hash,
-    {
-        let neighbours: Vec<T> = g.get_neighbours(&root).iter().map(|v| v.id).collect();
-        match_queue.extend(neighbours.iter());
-        assert!(match_queue.contains(&target), true);
-        match_queue.remove(&target);
-    }
-
-    ///TODO(YuChen): Check the given dfs permutation is valid for the given graph or not.
-    fn check_dfs_valid<T>(dfs: Vec<T>, g: Graph<T>) -> bool {
-        false
+        return vec.eq(&vec![1, 2, 3, 4])
+            && edges.eq(&vec![(1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (2, 4)]);
     }
 }
