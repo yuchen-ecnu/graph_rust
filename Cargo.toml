@@ -1,7 +1,12 @@
 [package]
 name = "graph_rust"
 version = "0.1.0"
-authors = ["cheny"]
+authors = ["Michael Chen <920901835@qq.com>"]
 edition = "2018"
 
 [dependencies]
+csv = "1"
+serde = "1"
+serde_derive = "1"
+csv-index = "0.1"
+uuid = { version = "0.7", features = ["serde", "v4"] }
