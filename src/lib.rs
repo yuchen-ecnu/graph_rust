@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn hdfs_reading_test(){
-        //TODO(Yu Chen):File system load failed
+        //FIXME(Yu Chen):File system load failed
         let cache = Rc::new(RefCell::new(HdfsFsCache::new()));  
         let fs: HdfsFs = cache.borrow_mut().get("hdfs://localhost:9000/").ok().unwrap();
         match fs.mkdir("/data") {
