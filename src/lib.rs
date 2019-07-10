@@ -949,9 +949,9 @@ mod tests {
 
     #[test]
     fn hdfs_reading_test(){
-        //FIXME(Yu Chen):File system load failed
-        let cache = Rc::new(RefCell::new(HdfsFsCache::new()));  
-        let fs: HdfsFs = cache.borrow_mut().get("hdfs://localhost:9000/").ok().unwrap();
+        //FIXME(Yu Chen):character set mismatch between hdfs server and client here
+        let cache = Rc::new(RefCell::new(HdfsFsCache::new()));
+        let fs: HdfsFs = cache.borrow_mut().get("hdfs://yccy.ddns.net:9000/").ok().unwrap();
         match fs.mkdir("/data") {
             Ok(_) => { println!("/data has been created") },
             Err(_)  => { panic!("/data creation has failed") }
