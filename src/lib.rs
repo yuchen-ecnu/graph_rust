@@ -838,6 +838,9 @@ mod tests {
     use rocksdb::{IteratorMode, Options, DB};
     use std::cmp::Ordering;
     use std::collections::HashMap;
+    use std::rc::Rc;
+    use std::cell::RefCell;
+    use hdfs::{HdfsFsCache,HdfsFs};
 
     #[test]
     fn file_reading_and_rocksdb_storing_test() -> Result<(), BuildGraphError> {
@@ -942,6 +945,17 @@ mod tests {
         let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
         assert_eq!(check_bfs_permutation_valid(&bfs_perm), true);
         Ok(())
+    }
+
+    #[test]
+    fn hdfs_reading_test(){
+        //TODO(Yu Chen):File system load failed
+        let cache = Rc::new(RefCell::new(HdfsFsCache::new()));  
+        let fs: HdfsFs = cache.borrow_mut().get("hdfs://localhost:9000/").ok().unwrap();
+        match fs.mkdir("/data") {
+            Ok(_) => { println!("/data has been created") },
+            Err(_)  => { panic!("/data creation has failed") }
+        }; 
     }
 
     fn parse_json_value_from_pointer(source: Box<[u8]>) -> JsonValue {

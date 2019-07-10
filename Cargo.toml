@@ -12,3 +12,4 @@ csv-index = "0.1"
 uuid = { version = "0.7", features = ["serde", "v4"] }
 rocksdb="0.12.2"
 json="0.11.14"
+hdfs = "0.0.4"
