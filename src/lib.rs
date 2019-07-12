@@ -10,6 +10,7 @@ use std::hash::Hash;
 use std::io::Cursor;
 use std::io::Write;
 use std::str::FromStr;
+use hdfs::HdfsErr;
 
 mod errors;
 
@@ -21,7 +22,6 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::thread::JoinHandle;
 use uuid::Uuid;
 
 /// This defines the acceptable attribute type: Int, Float Or Text
@@ -207,7 +207,6 @@ pub struct GraphReader {
     edge_file_path: String,
     node_file_path: Option<String>,
     thread_pool_size: u64,
-    thread_pool: Vec<JoinHandle<()>>,
 }
 
 impl GraphReader {
@@ -219,7 +218,6 @@ impl GraphReader {
             separate: b',',
             graph_type: GraphType::Directed,
             thread_pool_size: 4,
-            thread_pool: vec![],
         };
         g
     }
@@ -951,11 +949,16 @@ mod tests {
     fn hdfs_reading_test(){
         //FIXME(Yu Chen):character set mismatch between hdfs server and client here
         let cache = Rc::new(RefCell::new(HdfsFsCache::new()));
-        let fs: HdfsFs = cache.borrow_mut().get("hdfs://yccy.ddns.net:9000/").ok().unwrap();
-        match fs.mkdir("/data") {
-            Ok(_) => { println!("/data has been created") },
-            Err(_)  => { panic!("/data creation has failed") }
-        }; 
+        let fs: HdfsFs = cache.borrow_mut().get("hdfs://localhost",9000).ok().unwrap();
+        let hfile = fs.open("data/data_edges.csv").unwrap();
+        if !hfile.is_readable(){
+            println!("/data/data_edges.csv are not avaliable!");
+        }
+        let mut buf:[u8;500] = [0;500];
+        match hfile.read(&mut buf) {
+            Ok(_) => { println!("{}",String::from_utf8(buf.to_vec()).unwrap()) },
+            Err(e)  => { panic!("file read error") }
+        };
     }
 
     fn parse_json_value_from_pointer(source: Box<[u8]>) -> JsonValue {
