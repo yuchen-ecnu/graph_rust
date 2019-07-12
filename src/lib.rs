@@ -10,16 +10,18 @@ use std::hash::Hash;
 use std::io::Cursor;
 use std::io::Write;
 use std::str::FromStr;
+use hdfs::HdfsErr;
 
 mod errors;
 
 use crate::errors::graph_build_error::BuildGraphError;
 use errors::parse_attr_error::ParseAttrError;
+use json::JsonValue;
+use rocksdb::{Options, DB};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::thread::JoinHandle;
 use uuid::Uuid;
 
 /// This defines the acceptable attribute type: Int, Float Or Text
@@ -57,6 +59,16 @@ impl FromStr for Attr {
             return Ok(Attr::Int(s.parse()?));
         }
         Ok(Attr::Text(s.to_string()))
+    }
+}
+
+impl From<Attr> for JsonValue {
+    fn from(attr: Attr) -> Self {
+        match attr {
+            Attr::Int(i) => json::from(i),
+            Attr::Float(f) => json::from(f),
+            Attr::Text(t) => json::from(t),
+        }
     }
 }
 
@@ -195,7 +207,6 @@ pub struct GraphReader {
     edge_file_path: String,
     node_file_path: Option<String>,
     thread_pool_size: u64,
-    thread_pool: Vec<JoinHandle<()>>,
 }
 
 impl GraphReader {
@@ -207,7 +218,6 @@ impl GraphReader {
             separate: b',',
             graph_type: GraphType::Directed,
             thread_pool_size: 4,
-            thread_pool: vec![],
         };
         g
     }
@@ -279,6 +289,7 @@ impl GraphReader {
     ///     2. Read edge file in parallel by calling function `read_file_in_parallel`,
     ///     3. (Optional) Read node file in parallel if there exist a node file path,
     ///     4. Generating index for vertices vector and edges vector.
+    ///     5. Storing graph properties into rocksDB.
     ///
     /// # Feature Explanation
     /// 1. Storing layout of graph: in structure graph, we stores the edges and vertices in a
@@ -288,10 +299,19 @@ impl GraphReader {
     ///     cost a lot. So we generating two index for vertices and neighbours.
     /// 2. Vertex index used for indexing nodes by id and return the pos of vertex in vector `vertices`.
     ///     And neighbour_index used for indexing node's neighbours start and end index by source's
-    ///     id, and return pos in vector `edges`,
+    ///     id, and return pos in vector `edges`.
+    /// 3. In the process of storing graph properties into rocksDB, we try to open two ColumnFamily
+    ///     which are named `meta_data` and `data`. In `meta_data`, we storing the basic graph
+    ///     structure information,such as, the neighbours' id of vertices. And in `data`, we storing
+    ///     the properties of vertices and edges.
+    /// 4. In the process of storing properties, we aggregate the properties on vertices or edges
+    ///     into a same value with `id` or `source-target` as key , which is formatted as a `json`.
+    /// 5. For multi-graph, we aggregate the properties on the edges sharing the same source node
+    ///     and target node into a same value with `source-target` as key.
     pub fn build<T>(&mut self) -> Result<Graph<T>, BuildGraphError>
     where
         T: Eq + Hash + FromStr + Display + Clone + Copy + Debug + Send,
+        JsonValue: std::convert::From<T>,
         <T as FromStr>::Err: Debug,
         for<'de> T: Deserialize<'de>,
         T: 'static,
@@ -330,26 +350,61 @@ impl GraphReader {
             vertices_arc = vertices_rec;
         }
 
-        // Generating index
-        let mut vertices = Arc::try_unwrap(vertices_arc)?.into_inner()?;
+        // Generating index && Storing graph and properties into rocksdb
+        let vertices = Arc::try_unwrap(vertices_arc)?.into_inner()?;
         let mut edges = Arc::try_unwrap(edges_arc)?.into_inner()?;
+
+        let path = "graph_storage";
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf(&opts, path, &["meta_data", "data"]).unwrap();
+        db.drop_cf("meta_data");
+        db.drop_cf("data");
+        db.create_cf("meta_data", &opts);
+        db.create_cf("data", &opts);
+        let cf_meta = db.cf_handle("meta_data").unwrap();
+        let cf_data = db.cf_handle("data").unwrap();
 
         let mut cur_edge_index = 0;
         let mut cur_node_index = 0;
         for (id, v) in vertices {
-            let edge_opt = edges.get_mut(&id);
+            db.put_cf(
+                cf_data,
+                json::stringify(v.id),
+                json::stringify(v.attrs.clone()),
+            );
+            let mut default_vec = vec![];
+            let edge_vec = edges.get_mut(&id).unwrap_or_else(|| &mut default_vec);
+            let neighbours: Vec<T> = edge_vec.iter().map(|e| e.target).collect();
+            db.put_cf(cf_meta, json::stringify(id), json::stringify(neighbours));
+
             g.vertex_index.insert(v.id, cur_node_index);
             cur_node_index += 1;
             g.vertices.push(v);
-            if edge_opt.is_none() {
-                continue;
-            }
-            let edge_vec: &mut Vec<Edge<T>> = edge_opt.unwrap();
             g.neighbour_index
                 .insert(id, (cur_edge_index, cur_edge_index + edge_vec.len()));
             cur_edge_index = cur_edge_index + edge_vec.len();
             g.edges.append(edge_vec);
         }
+        //storing data of graph
+        for (source, edge_vec) in edges {
+            // filter the parallel edge in the multi-graph and aggregate properties of them.
+            let mut filter_map: HashMap<T, Vec<Attr>> = HashMap::new();
+            for mut e in edge_vec {
+                let mut default_vec = vec![];
+                filter_map
+                    .get_mut(&e.target)
+                    .unwrap_or_else(|| &mut default_vec)
+                    .append(&mut e.attrs);
+            }
+            for (target,attr_vec) in filter_map{
+                let key = source.to_string() + "-" + String::as_str(&target.to_string());
+                db.put_cf(cf_data, key, json::stringify(attr_vec));
+            }
+        }
+        DB::destroy(&opts, path);
+
         Ok(g)
     }
 }
@@ -416,8 +471,7 @@ where
 
     // Calculate and distribute jobs index for threads.
     let job_size = idx.len() / worker_count + 1;
-    let mut real_worker_count = worker_count;
-    real_worker_count = (idx.len() - 1) / job_size;
+    let mut real_worker_count = (idx.len() - 1) / job_size;
     if (idx.len() - 1) % job_size != 0 {
         real_worker_count += 1;
     }
@@ -777,13 +831,60 @@ fn other_traversal_algorithms() {}
 #[cfg(test)]
 mod tests {
     use crate::errors::graph_build_error::BuildGraphError;
-    use crate::{Bfs, Dfs, Graph, GraphReader, GraphType, Vertex};
+    use crate::{Bfs, Dfs, Edge, Graph, GraphReader, GraphType, Vertex};
+    use json::JsonValue;
+    use rocksdb::{IteratorMode, Options, DB};
     use std::cmp::Ordering;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    use std::cell::RefCell;
+    use hdfs::{HdfsFsCache,HdfsFs};
 
     #[test]
-    fn file_reading_test() -> Result<(), BuildGraphError> {
+    fn file_reading_and_rocksdb_storing_test() -> Result<(), BuildGraphError> {
         let g = generate_directed_graph(10)?;
         assert_eq!(check_graph_validation(g), true);
+
+        // testing data in rocksdb valid
+        let db = DB::open_cf(&Options::default(), "graph_storage", &["meta_data", "data"])?;
+        let vertex_iter =
+            db.iterator_cf(db.cf_handle("meta_data").unwrap(), IteratorMode::Start)?;
+        let vertices: Vec<Vertex<i32>> = vertex_iter
+            .map(|(id, _value)| {
+                let id = parse_json_value_from_pointer(id).as_i32().unwrap();
+                Vertex { id, attrs: vec![] }
+            })
+            .collect();
+        let edge_iter = db.iterator_cf(db.cf_handle("meta_data").unwrap(), IteratorMode::Start)?;
+        let edges: Vec<Edge<i32>> = edge_iter
+            .flat_map(|(source, edge)| {
+                let source = parse_json_value_from_pointer(source).as_i32().unwrap();
+                let mut vec = vec![];
+
+                let json = parse_json_value_from_pointer(edge);
+                if let JsonValue::Array(neighbour_vec) = json {
+                    for target in neighbour_vec {
+                        vec.push(Edge {
+                            source,
+                            target: target.as_i32().unwrap(),
+                            attrs: vec![],
+                        });
+                    }
+                }
+                vec
+            })
+            .collect();
+        let graph_in_rocksdb = Graph {
+            graph_type: GraphType::Directed,
+            vertices,
+            edges,
+            vertex_key: vec![],
+            edge_key: vec![],
+            vertex_index: HashMap::new(),
+            neighbour_index: HashMap::new(),
+        };
+        assert_eq!(check_graph_validation(graph_in_rocksdb), true);
+
         Ok(())
     }
 
@@ -842,6 +943,31 @@ mod tests {
         let bfs_perm: Vec<i32> = res.iter().map(|v| v.id).collect();
         assert_eq!(check_bfs_permutation_valid(&bfs_perm), true);
         Ok(())
+    }
+
+    #[test]
+    fn hdfs_reading_test(){
+        //FIXME(Yu Chen):character set mismatch between hdfs server and client here
+        let cache = Rc::new(RefCell::new(HdfsFsCache::new()));
+        let fs: HdfsFs = cache.borrow_mut().get("hdfs://localhost",9000).ok().unwrap();
+        let hfile = fs.open("data/data_edges.csv").unwrap();
+        if !hfile.is_readable(){
+            println!("/data/data_edges.csv are not avaliable!");
+        }
+        let mut buf:[u8;500] = [0;500];
+        match hfile.read(&mut buf) {
+            Ok(_) => { println!("{}",String::from_utf8(buf.to_vec()).unwrap()) },
+            Err(e)  => { panic!("file read error") }
+        };
+    }
+
+    fn parse_json_value_from_pointer(source: Box<[u8]>) -> JsonValue {
+        json::parse(
+            String::from_utf8((*source.to_vec()).to_owned())
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap()
     }
 
     /// Generate a undirected `Graph` instance from test files

@@ -76,3 +76,11 @@ impl<T> From<PoisonError<HashMap<T, Vec<Edge<T>>>>> for BuildGraphError {
         }
     }
 }
+
+impl From<rocksdb::Error> for BuildGraphError {
+    fn from(e: rocksdb::Error) -> Self {
+        BuildGraphError {
+            source: e.description().to_string(),
+        }
+    }
+}
